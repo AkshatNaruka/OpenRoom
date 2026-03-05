@@ -418,78 +418,82 @@ export function resetActionsCache(): void {
 // ============ Tool Definition Generation ============
 
 /**
- * Convert App Actions to OpenAI function calling format tools
+ * Single generic app_action tool that replaces per-app tool definitions.
+ * LLM discovers available actions by reading meta.yaml via file tools.
  */
-export function getToolDefinitions(): Array<{
+export function getAppActionToolDefinition(): {
   type: 'function';
   function: {
     name: string;
     description: string;
-    parameters: {
-      type: 'object';
-      properties: Record<string, unknown>;
-      required: string[];
-    };
+    parameters: { type: 'object'; properties: Record<string, unknown>; required: string[] };
   };
-}> {
-  const tools: Array<{
-    type: 'function';
+} {
+  return {
+    type: 'function',
     function: {
-      name: string;
-      description: string;
+      name: 'app_action',
+      description:
+        "Trigger an action on an app. Read the app's meta.yaml first to discover available action types and their parameters.",
       parameters: {
-        type: 'object';
-        properties: Record<string, unknown>;
-        required: string[];
-      };
-    };
-  }> = [];
-
-  for (const app of APP_REGISTRY) {
-    for (const action of app.actions) {
-      const properties: Record<string, unknown> = {};
-      const required: string[] = [];
-
-      for (const param of action.params) {
-        const prop: Record<string, unknown> = {
-          type: 'string',
-          description: param.description,
-        };
-        if (param.enum) {
-          prop.enum = param.enum;
-        }
-        properties[param.name] = prop;
-        if (param.required) {
-          required.push(param.name);
-        }
-      }
-
-      tools.push({
-        type: 'function',
-        function: {
-          name: `${app.appName}__${action.name}`,
-          description: `[${app.displayName}] ${action.description}`,
-          parameters: {
-            type: 'object',
-            properties,
-            required,
+        type: 'object',
+        properties: {
+          app_name: {
+            type: 'string',
+            description: 'The appName of the target app (from list_apps)',
+          },
+          action_type: {
+            type: 'string',
+            description: 'The action type to trigger (e.g. REFRESH_TRACKS, SYNC_STATE, OPEN_APP)',
+          },
+          params: {
+            type: 'string',
+            description: 'JSON string of action parameters, e.g. \'{"trackId":"123"}\'',
           },
         },
-      });
-    }
-  }
-
-  console.info('[ToolLog] getToolDefinitions: tool count=', tools.length);
-  return tools;
+        required: ['app_name', 'action_type'],
+      },
+    },
+  };
 }
 
 /**
- * Parse tool call name into appId + actionType
+ * Execute the generic app_action tool call.
+ * Returns { appId, actionType, params } for dispatch, or an error string.
  */
-export function parseToolName(toolName: string): { appId: number; actionType: string } | null {
-  const parts = toolName.split('__');
-  if (parts.length !== 2) return null;
-  const app = APP_REGISTRY.find((a) => a.appName === parts[0]);
-  if (!app) return null;
-  return { appId: app.appId, actionType: parts[1] };
+export function resolveAppAction(
+  appName: string,
+  actionType: string,
+): { appId: number; actionType: string } | string {
+  const app = APP_REGISTRY.find((a) => a.appName === appName);
+  if (!app) return `error: unknown app "${appName}". Call list_apps to see available apps.`;
+  return { appId: app.appId, actionType };
+}
+
+// ============ list_apps Tool ============
+
+export function getListAppsToolDefinition(): {
+  type: 'function';
+  function: {
+    name: string;
+    description: string;
+    parameters: { type: 'object'; properties: Record<string, unknown>; required: string[] };
+  };
+} {
+  return {
+    type: 'function',
+    function: {
+      name: 'list_apps',
+      description:
+        'List all available apps on the device. Returns app names and display names. Call this first to discover what apps are available.',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  };
+}
+
+export function executeListApps(): string {
+  const apps = APP_REGISTRY.filter((a) => a.appName !== 'os').map(
+    (a) => `${a.displayName} (appId: ${a.appId}, appName: ${a.appName})`,
+  );
+  return `Available apps:\n${apps.join('\n')}`;
 }

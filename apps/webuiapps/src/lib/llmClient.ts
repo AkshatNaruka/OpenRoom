@@ -68,12 +68,12 @@ interface LLMResponse {
 const CONFIG_KEY = 'webuiapps-llm-config';
 
 const DEFAULT_CONFIGS: Record<LLMProvider, Omit<LLMConfig, 'apiKey'>> = {
-  openai: { provider: 'openai', baseUrl: 'https://api.openai.com', model: 'gpt-4o' },
+  openai: { provider: 'openai', baseUrl: 'https://api.openai.com', model: 'gpt-5.3-chat-latest' },
   deepseek: { provider: 'deepseek', baseUrl: 'https://api.deepseek.com', model: 'deepseek-chat' },
   anthropic: {
     provider: 'anthropic',
     baseUrl: 'https://api.anthropic.com',
-    model: 'claude-sonnet-4-20250514',
+    model: 'claude-opus-4-6',
   },
   minimax: {
     provider: 'minimax',

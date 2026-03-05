@@ -17,11 +17,14 @@ import {
   type ImageGenProvider,
 } from '@/lib/imageGenClient';
 import {
-  getToolDefinitions,
-  parseToolName,
+  getAppActionToolDefinition,
+  resolveAppAction,
+  getListAppsToolDefinition,
+  executeListApps,
   APP_REGISTRY,
   loadActionsFromMeta,
 } from '@/lib/appRegistry';
+import { seedMetaFiles } from '@/lib/seedMeta';
 import { dispatchAgentAction, onUserAction } from '@/lib/vibeContainerMock';
 import { getFileToolDefinitions, isFileTool, executeFileTool } from '@/lib/fileTools';
 import {
@@ -38,58 +41,23 @@ interface DisplayMessage {
   imageUrl?: string;
 }
 
-function buildSystemPrompt(): string {
-  const appRows = APP_REGISTRY.filter((a) => a.appName !== 'os')
-    .map((a) => `| ${a.displayName} | ${a.appName} |`)
-    .join('\n');
+function buildSystemPrompt(hasImageGen: boolean): string {
+  return `You are a helpful assistant that can interact with apps on the user's device. Respond in English by default. If the user writes in another language, switch to that language.
 
-  return `You are a helpful assistant that can interact with various apps on the user's device.
-You have two types of tools:
+For casual conversation (greetings, questions, chat), just reply naturally without using any tools.
 
-## App Action Tools
-Tool names formatted as "{appName}__{ACTION_TYPE}". Use these to trigger app actions (e.g. refresh UI, play music).
-All parameters are strings.
+When the user wants to interact with an app:
+1. Call list_apps to discover available apps and their appName
+2. file_read("apps/{appName}/meta.yaml") to learn available actions
+3. file_read("apps/{appName}/guide.md") to learn data structure and JSON schema
+4. file_list/file_read to explore data in "apps/{appName}/data/"
+5. file_write/file_delete to modify data (follow the JSON schema)
+6. app_action to notify the app to reload (e.g. REFRESH_*, SYNC_STATE)
 
-## File Tools
-- file_list: List files in a directory. Path relative to workspace root.
-- file_read: Read a file's content. Path relative to workspace root.
-- file_write: Write content to a file. Path relative to workspace root.
-- file_delete: Delete a file from storage. Path relative to workspace root.
+NAS paths in guide.md like "/articles/xxx.json" map to "apps/{appName}/data/articles/xxx.json".
+After writing data, ALWAYS call app_action with the corresponding REFRESH action.
 
-App data is stored at "apps/{appName}/data/". Each app also has "apps/{appName}/meta.yaml" (capabilities) and "apps/{appName}/guide.md" (data schema).
-
-App name mapping (use these exact names in file paths and tool prefixes):
-| Display Name | appName |
-|---|---|
-${appRows}
-
-## Workflow
-Use file tools to read/write app data, then use the app action tool to notify the app to reload.
-
-### Steps:
-1. file_read("apps/{appName}/meta.yaml") to understand the app's capabilities and actions
-2. file_read("apps/{appName}/guide.md") to learn the data structure and JSON schema
-3. file_list / file_read to explore existing data in "apps/{appName}/data/"
-4. file_write to create or modify data, file_delete to remove data (follow the JSON schema from guide.md)
-5. Use the app action tool (REFRESH_*, SYNC_STATE, AGENT_MOVE) to notify the app to reload
-
-### Example - Game move:
-1. file_read("apps/{appName}/data/state.json") → get current game state
-2. Calculate your move, update the state JSON
-3. file_write("apps/{appName}/data/state.json", updatedState) → save
-4. {appName}__AGENT_MOVE → app refreshes UI
-
-### Important:
-- ALWAYS read meta.yaml and guide.md first before operating on an unfamiliar app.
-- After writing data, ALWAYS call the corresponding REFRESH action so the app picks up changes.
-- All NAS file operations mentioned in guide.md (read, write, delete, list) map directly to file tools (file_read, file_write, file_delete, file_list). NAS paths like "/articles/xxx.json" translate to "apps/{appName}/data/articles/xxx.json".
-
-## Rules
-- Always respond in the same language the user uses.
-- When you receive a "[User performed action in ...]" message, it means the user interacted with an app.
-- For games, you MUST respond with your own move. Think strategically and play to win, but keep the game fun.
-- When the user asks you to generate/draw/create an image, use the generate_image tool with a detailed English prompt.
-- When creating content that needs an image, first generate the image with savePath pointing to the app's data directory (e.g. savePath="apps/{appName}/data/images/img-{timestamp}.json"), then reference the relative path "/images/img-{timestamp}.json" in the content's imageUrl field.`;
+When you receive "[User performed action in ... (appName: xxx)]", the appName is already provided. Read its meta.yaml to understand available actions, then respond accordingly. For games, respond with your own move — think strategically.${hasImageGen ? '\n\nYou can also use generate_image to create images from text prompts.' : ''}`;
 }
 
 const ChatPanel: React.FC<{ onClose: () => void; visible?: boolean }> = ({
@@ -186,7 +154,7 @@ const ChatPanel: React.FC<{ onClose: () => void; visible?: boolean }> = ({
       const app = APP_REGISTRY.find((a) => a.appId === action.app_id);
       if (!app) return;
 
-      const actionMsg = `[User performed action in ${app.displayName}] action_type: ${action.action_type}, params: ${JSON.stringify(action.params || {})}`;
+      const actionMsg = `[User performed action in ${app.displayName} (appName: ${app.appName})] action_type: ${action.action_type}, params: ${JSON.stringify(action.params || {})}`;
       actionQueueRef.current.push(actionMsg);
       processActionQueue();
     });
@@ -235,15 +203,18 @@ const ChatPanel: React.FC<{ onClose: () => void; visible?: boolean }> = ({
       'provider:',
       cfg.provider,
     );
+    await seedMetaFiles();
     await loadActionsFromMeta();
+    const hasImageGen = !!imageGenConfigRef.current?.apiKey;
     const tools = [
-      ...getToolDefinitions(),
+      getListAppsToolDefinition(),
+      getAppActionToolDefinition(),
       ...getFileToolDefinitions(),
-      ...getImageGenToolDefinitions(),
+      ...(hasImageGen ? getImageGenToolDefinitions() : []),
     ];
     console.info('[ToolLog] ChatPanel: tools passed to chat(), count=', tools.length);
     const fullMessages: ChatMessage[] = [
-      { role: 'system', content: buildSystemPrompt() },
+      { role: 'system', content: buildSystemPrompt(hasImageGen) },
       ...history,
     ];
 
@@ -251,9 +222,21 @@ const ChatPanel: React.FC<{ onClose: () => void; visible?: boolean }> = ({
     let iterations = 0;
     const maxIterations = 10;
 
+    console.info('[ChatDebug] === START conversation ===');
+    console.info('[ChatDebug] messages sent to LLM:', JSON.stringify(currentMessages, null, 2));
+    console.info(
+      '[ChatDebug] tools:',
+      tools.map((t) => (t as { function: { name: string } }).function.name),
+    );
+
     while (iterations < maxIterations) {
       iterations++;
+      console.info(`[ChatDebug] --- iteration ${iterations} ---`);
+      console.info('[ChatDebug] messages count:', currentMessages.length);
       const response = await chat(currentMessages, tools, cfg);
+
+      console.info('[ChatDebug] LLM response content:', response.content);
+      console.info('[ChatDebug] LLM toolCalls:', JSON.stringify(response.toolCalls, null, 2));
 
       if (response.toolCalls.length === 0) {
         // No tool calls, just text response
@@ -300,6 +283,17 @@ const ChatPanel: React.FC<{ onClose: () => void; visible?: boolean }> = ({
           // ignore parse error
         }
 
+        // list_apps tool
+        if (tc.function.name === 'list_apps') {
+          const result = executeListApps();
+          console.info('[ChatDebug] list_apps result:', result);
+          currentMessages = [
+            ...currentMessages,
+            { role: 'tool', content: result, tool_call_id: tc.id },
+          ];
+          continue;
+        }
+
         // File tool calls — direct file operations
         if (isFileTool(tc.function.name)) {
           addMessage({
@@ -309,6 +303,10 @@ const ChatPanel: React.FC<{ onClose: () => void; visible?: boolean }> = ({
           });
           try {
             const result = await executeFileTool(tc.function.name, params);
+            console.info(
+              `[ChatDebug] ${tc.function.name}(${JSON.stringify(params)}) result:`,
+              result.slice(0, 500),
+            );
             currentMessages = [
               ...currentMessages,
               { role: 'tool', content: result, tool_call_id: tc.id },
@@ -363,43 +361,60 @@ const ChatPanel: React.FC<{ onClose: () => void; visible?: boolean }> = ({
           continue;
         }
 
-        const parsed = parseToolName(tc.function.name);
-        if (!parsed) {
-          currentMessages = [
-            ...currentMessages,
-            { role: 'tool', content: 'error: unknown tool', tool_call_id: tc.id },
-          ];
+        // app_action tool
+        if (tc.function.name === 'app_action') {
+          const resolved = resolveAppAction(params.app_name, params.action_type);
+          if (typeof resolved === 'string') {
+            currentMessages = [
+              ...currentMessages,
+              { role: 'tool', content: resolved, tool_call_id: tc.id },
+            ];
+            continue;
+          }
+
+          addMessage({
+            id: String(Date.now()) + tc.id,
+            role: 'tool',
+            content: `Calling ${params.app_name}/${params.action_type}...`,
+          });
+
+          let actionParams: Record<string, string> = {};
+          if (params.params) {
+            try {
+              actionParams = JSON.parse(params.params);
+            } catch {
+              // use empty params
+            }
+          }
+
+          try {
+            const result = await dispatchAgentAction({
+              app_id: resolved.appId,
+              action_type: resolved.actionType,
+              params: actionParams,
+            });
+            currentMessages = [
+              ...currentMessages,
+              { role: 'tool', content: result, tool_call_id: tc.id },
+            ];
+          } catch (err) {
+            currentMessages = [
+              ...currentMessages,
+              {
+                role: 'tool',
+                content: `error: ${err instanceof Error ? err.message : String(err)}`,
+                tool_call_id: tc.id,
+              },
+            ];
+          }
           continue;
         }
 
-        // Regular App tool call
-        addMessage({
-          id: String(Date.now()) + tc.id,
-          role: 'tool',
-          content: `Calling ${tc.function.name}...`,
-        });
-
-        try {
-          const result = await dispatchAgentAction({
-            app_id: parsed.appId,
-            action_type: parsed.actionType,
-            params,
-          });
-
-          currentMessages = [
-            ...currentMessages,
-            { role: 'tool', content: result, tool_call_id: tc.id },
-          ];
-        } catch (err) {
-          currentMessages = [
-            ...currentMessages,
-            {
-              role: 'tool',
-              content: `error: ${err instanceof Error ? err.message : String(err)}`,
-              tool_call_id: tc.id,
-            },
-          ];
-        }
+        // Unknown tool
+        currentMessages = [
+          ...currentMessages,
+          { role: 'tool', content: 'error: unknown tool', tool_call_id: tc.id },
+        ];
       }
 
       // Update chat history with tool interactions
@@ -611,8 +626,8 @@ const SettingsModal: React.FC<{
             value={igProvider}
             onChange={(e) => handleIgProviderChange(e.target.value as ImageGenProvider)}
           >
-            <option value="openai">OpenAI (DALL-E)</option>
-            <option value="gemini">Gemini (nano-banana-2)</option>
+            <option value="openai">OpenAI</option>
+            <option value="gemini">Gemini</option>
           </select>
         </div>
 
@@ -643,9 +658,6 @@ const SettingsModal: React.FC<{
             value={igModel}
             onChange={(e) => setIgModel(e.target.value)}
           />
-          {igProvider === 'gemini' && igModel === 'gemini-3.1-flash-image-preview' && (
-            <span className={styles.modelHint}>nano-banana-2</span>
-          )}
         </div>
 
         <div className={styles.field}>

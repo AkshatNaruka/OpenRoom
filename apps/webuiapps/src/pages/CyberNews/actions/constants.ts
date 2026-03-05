@@ -1,4 +1,4 @@
-export const APP_ID = 10008;
+export const APP_ID = 14;
 export const APP_NAME = 'cyberNews';
 
 // File paths
