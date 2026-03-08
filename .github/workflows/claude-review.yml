@@ -35,8 +35,7 @@ jobs:
           anthropic_api_key: ${{ secrets.MINIMAX_API_KEY }}
           show_full_output: true
           prompt: |
-            Review this pull request and always leave a review comment on the PR summarizing your findings.
-            Even if the changes are minor, post a brief comment acknowledging the review.
+            Review this pull request. Use `gh pr diff $PR_NUMBER` to get the diff, then analyze the changes.
             Focus on:
             1. Code correctness and potential bugs
             2. TypeScript type safety
@@ -45,6 +44,11 @@ jobs:
             5. Code style consistency
 
             Be concise and actionable. Only comment on meaningful issues, not style nitpicks already covered by linters.
+
+            IMPORTANT: After completing your review, you MUST post your findings as a PR comment using:
+            gh pr comment $PR_NUMBER --body "YOUR_REVIEW_HERE"
+
+            The PR number is available via: gh pr list --state open --json number --jq '.[0].number'
           claude_args: '--model MiniMax-M2.5 --max-turns 20 --allowedTools "Bash(git:*),Bash(gh:*),Read,Glob,Grep,WebFetch"'
 
   interactive:
