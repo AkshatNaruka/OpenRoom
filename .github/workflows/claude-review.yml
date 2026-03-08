@@ -45,7 +45,7 @@ jobs:
             5. Code style consistency
 
             Be concise and actionable. Only comment on meaningful issues, not style nitpicks already covered by linters.
-          claude_args: "--model MiniMax-M2.5 --max-turns 3"
+          claude_args: '--model MiniMax-M2.5 --max-turns 20 --allowedTools "Bash(git:*),Bash(gh:*),Read,Glob,Grep,WebFetch"'
 
   interactive:
     if: |
@@ -65,4 +65,4 @@ jobs:
           ANTHROPIC_BASE_URL: https://api.minimax.io/anthropic
         with:
           anthropic_api_key: ${{ secrets.MINIMAX_API_KEY }}
-          claude_args: "--model MiniMax-M2.5 --max-turns 10"
+          claude_args: '--model MiniMax-M2.5 --max-turns 20 --allowedTools "Bash(git:*),Bash(gh:*),Read,Glob,Grep,WebFetch,Edit,Write"'
