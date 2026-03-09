@@ -1,9 +1,9 @@
 /**
- * Seed each APP's meta.yaml and guide.md into IndexedDB on initialization
+ * Seed each APP's meta.yaml and guide.md into disk storage on initialization
  * So Agent can read them via file_read("apps/{appName}/meta.yaml")
  */
 
-import * as idb from './indexedDbStorage';
+import * as idb from './diskStorage';
 import { getSourceDirToAppName } from './appRegistry';
 
 // Eager import — inlined as strings at build time
@@ -38,6 +38,6 @@ export async function seedMetaFiles(): Promise<void> {
 
   if (files.length > 0) {
     await idb.putTextFilesByJSON({ files });
-    console.info(`[seedMeta] Seeded ${files.length} meta files into IndexedDB`);
+    console.info(`[seedMeta] Seeded ${files.length} meta files to disk`);
   }
 }

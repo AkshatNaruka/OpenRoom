@@ -356,10 +356,13 @@ export function createAppFileApi(appName: string): FileOperations {
 
       return result.files.map((entry) => {
         // entry.path may be a full cloud path (e.g. "apps/twitter/data/posts"),
+        // a session-prefixed path (e.g. "charId/modId/apps/twitter/data/posts"),
         // or a relative name (e.g. "posts"). Extract the entry name relative to the current directory.
         let entryName = entry.path;
-        if (cloudDirPath && entryName.startsWith(`${cloudDirPath}/`)) {
-          entryName = entryName.slice(cloudDirPath.length + 1);
+        const cloudDirSuffix = `${cloudDirPath}/`;
+        const suffixIndex = entryName.indexOf(cloudDirSuffix);
+        if (suffixIndex !== -1) {
+          entryName = entryName.slice(suffixIndex + cloudDirSuffix.length);
         }
 
         // Build FileNode.path using internal path (without prefix)

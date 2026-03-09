@@ -1,12 +1,32 @@
 /**
- * Image Generation Tool — LLM tool independent of the App system
- * Same level as fileTools, intercepted and handled directly in ChatPanel
+ * Image Generation Tool — LLM tool independent of the App system.
+ * Generates images and saves them as real image files to disk storage.
  */
 
-import * as idb from './indexedDbStorage';
+import * as idb from './diskStorage';
+import { getSessionPath } from './sessionPath';
 import { generateImage, type ImageGenConfig } from './imageGenClient';
 
 const TOOL_NAME = 'generate_image';
+const IMAGES_DIR = 'generated-images';
+
+function mimeToExt(mime: string): string {
+  const map: Record<string, string> = {
+    'image/png': 'png',
+    'image/jpeg': 'jpg',
+    'image/webp': 'webp',
+    'image/gif': 'gif',
+  };
+  return map[mime] || 'png';
+}
+
+/** Build an accessible URL for a file stored via session-data API */
+function buildFileUrl(filePath: string): string {
+  const session = getSessionPath();
+  const cleaned = filePath.startsWith('/') ? filePath.slice(1) : filePath;
+  const fullPath = session ? `${session}/apps/${cleaned}` : `apps/${cleaned}`;
+  return `/api/session-data?path=${encodeURIComponent(fullPath)}`;
+}
 
 export function getImageGenToolDefinitions(): Array<{
   type: 'function';
@@ -25,7 +45,8 @@ export function getImageGenToolDefinitions(): Array<{
       type: 'function',
       function: {
         name: TOOL_NAME,
-        description: 'Generate an image from a text prompt',
+        description:
+          'Generate an image from a text prompt. The image is displayed in chat and saved to disk. Returns a url.',
         parameters: {
           type: 'object',
           properties: {
@@ -33,13 +54,8 @@ export function getImageGenToolDefinitions(): Array<{
               type: 'string',
               description: 'Detailed description of the image to generate',
             },
-            savePath: {
-              type: 'string',
-              description:
-                'Absolute IDB path to save the generated image, e.g. "apps/{appName}/data/images/img-001.json". The image is saved as { id, src, createdAt }. Use the corresponding relative path (e.g. "/images/img-001.json") in the app\'s data to reference it.',
-            },
           },
-          required: ['prompt', 'savePath'],
+          required: ['prompt'],
         },
       },
     },
@@ -59,34 +75,18 @@ export async function executeImageGenTool(
   }
 
   const imageResult = await generateImage(params.prompt || '', config);
-  const dataUrl = `data:${imageResult.mimeType};base64,${imageResult.base64}`;
+  const ext = mimeToExt(imageResult.mimeType);
   const imageId = `img-${Date.now()}`;
-  const savePath = params.savePath;
+  const fileName = `${imageId}.${ext}`;
+  const filePath = `${IMAGES_DIR}/${fileName}`;
+  const dataUrl = `data:${imageResult.mimeType};base64,${imageResult.base64}`;
 
-  if (savePath) {
-    const lastSlash = savePath.lastIndexOf('/');
-    const dir = savePath.slice(0, lastSlash);
-    const name = savePath.slice(lastSlash + 1).endsWith('.json')
-      ? savePath.slice(lastSlash + 1)
-      : savePath.slice(lastSlash + 1) + '.json';
-    await idb.putTextFilesByJSON({
-      files: [
-        {
-          path: dir,
-          name,
-          content: JSON.stringify({
-            id: imageId,
-            src: dataUrl,
-            createdAt: Date.now(),
-          }),
-        },
-      ],
-    });
+  try {
+    await idb.putBinaryFile(filePath, imageResult.base64, imageResult.mimeType);
+    const url = buildFileUrl(filePath);
+    return { result: `success: image generated, url=${url}`, dataUrl };
+  } catch {
+    // Fallback: return dataUrl if save failed
+    return { result: `success: image generated, url=${dataUrl}`, dataUrl };
   }
-
-  const resultMsg = savePath
-    ? `success: image generated, id=${imageId}, saved to ${savePath}`
-    : `success: image generated, id=${imageId}`;
-
-  return { result: resultMsg, dataUrl };
 }

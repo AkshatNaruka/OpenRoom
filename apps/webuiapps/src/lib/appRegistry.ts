@@ -2,10 +2,10 @@
  * App Action Registry
  *
  * Static info (appId, appName, route, displayName) is defined in code.
- * Action definitions are dynamically loaded from each App's meta.yaml (stored in IndexedDB).
+ * Action definitions are dynamically loaded from each App's meta.yaml (stored on disk).
  */
 
-import * as idb from './indexedDbStorage';
+import * as idb from './diskStorage';
 
 // ============ Type Definitions ============
 
@@ -174,9 +174,15 @@ const OS_ACTIONS: AppActionDef[] = [
   {
     name: 'SET_WALLPAPER',
     description:
-      'Change wallpaper. Pass wallpaper_url parameter, which must be from /wallpaper/list.json, custom URLs are not allowed',
+      'Change the desktop wallpaper. wallpaper_url must be a https URL or a data URL (data:image/...). ' +
+      'You can use the dataUrl returned by generate_image, or any https image/video URL.',
     params: [
-      { name: 'wallpaper_url', type: 'string', description: 'Wallpaper URL', required: true },
+      {
+        name: 'wallpaper_url',
+        type: 'string',
+        description: 'https URL or data URL for the wallpaper',
+        required: true,
+      },
     ],
   },
 ];
@@ -376,7 +382,7 @@ function parseParamsList(
 let _loaded = false;
 
 /**
- * Load all App meta.yaml from IndexedDB, parse actions and populate APP_REGISTRY.
+ * Load all App meta.yaml from disk storage, parse actions and populate APP_REGISTRY.
  * Should be called once before ChatPanel first uses tool definitions.
  */
 export async function loadActionsFromMeta(): Promise<void> {
@@ -434,7 +440,8 @@ export function getAppActionToolDefinition(): {
     function: {
       name: 'app_action',
       description:
-        "Trigger an action on an app. Read the app's meta.yaml first to discover available action types and their parameters.",
+        "Trigger an action on an app. Read the app's meta.yaml first to discover available action types and their parameters. " +
+        'OS-level actions (OPEN_APP, CLOSE_APP, SET_WALLPAPER) MUST use app_name="os".',
       parameters: {
         type: 'object',
         properties: {
@@ -495,5 +502,11 @@ export function executeListApps(): string {
   const apps = APP_REGISTRY.filter((a) => a.appName !== 'os').map(
     (a) => `${a.displayName} (appId: ${a.appId}, appName: ${a.appName})`,
   );
-  return `Available apps:\n${apps.join('\n')}`;
+  return (
+    `Available apps:\n${apps.join('\n')}\n\n` +
+    'OS-level actions (use app_name="os"):\n' +
+    '- OPEN_APP: open an app (params: app_id)\n' +
+    '- CLOSE_APP: close an app (params: app_id)\n' +
+    '- SET_WALLPAPER: change wallpaper (params: wallpaper_url)'
+  );
 }

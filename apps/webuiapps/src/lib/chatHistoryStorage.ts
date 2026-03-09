@@ -1,8 +1,8 @@
 /**
  * Chat History Persistence
  *
- * Persists chat history (display messages + LLM conversation history) to
- * ~/.openroom/history/chat.json via the dev-server API, with localStorage fallback.
+ * Persists chat history per session (character × mod) to
+ * ~/.openroom/sessions/{charId}/{modId}/chat.json via dev-server API.
  */
 
 import type { ChatMessage } from './llmClient';
@@ -19,84 +19,68 @@ export interface ChatHistoryData {
   savedAt: number;
   messages: DisplayMessage[];
   chatHistory: ChatMessage[];
+  suggestedReplies?: string[];
 }
 
-const STORAGE_KEY = 'webuiapps-chat-history';
-const API_PATH = '/api/chat-history';
+/** Build session path segment from character and mod IDs */
+export function buildSessionPath(charId: string, modId: string): string {
+  return `${charId}/${modId}`;
+}
 
-/**
- * Load chat history — priority: local file > localStorage.
- */
-export async function loadChatHistory(): Promise<ChatHistoryData | null> {
-  // 1. Try local file via dev-server API
+const API_PATH = '/api/session-data';
+
+function apiUrl(sessionPath: string, file: string): string {
+  return `${API_PATH}?path=${encodeURIComponent(`${sessionPath}/chat/${file}`)}`;
+}
+
+export async function loadChatHistory(sessionPath: string): Promise<ChatHistoryData | null> {
   try {
-    const res = await fetch(API_PATH);
+    const res = await fetch(apiUrl(sessionPath, 'chat.json'));
     if (res.ok) {
       const data: ChatHistoryData = await res.json();
       if (data && data.version === 1) {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
         return data;
       }
     }
   } catch {
-    // API not available — fall through
+    // API not available
   }
-
-  // 2. Fall back to localStorage
-  return loadChatHistorySync();
+  return null;
 }
 
-/**
- * Synchronous read from localStorage cache.
- */
-export function loadChatHistorySync(): ChatHistoryData | null {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return null;
-    const data: ChatHistoryData = JSON.parse(raw);
-    return data && data.version === 1 ? data : null;
-  } catch {
-    return null;
-  }
+/** @deprecated kept for backward compat, always returns null now */
+export function loadChatHistorySync(_sessionPath: string): ChatHistoryData | null {
+  return null;
 }
 
-/**
- * Save chat history — writes to both localStorage and local file.
- */
 export async function saveChatHistory(
+  sessionPath: string,
   messages: DisplayMessage[],
   chatHistory: ChatMessage[],
+  suggestedReplies?: string[],
 ): Promise<void> {
   const data: ChatHistoryData = {
     version: 1,
     savedAt: Date.now(),
     messages,
     chatHistory,
+    suggestedReplies,
   };
 
-  // Always write localStorage (sync, instant)
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-
-  // Best-effort write to local file
   try {
-    await fetch(API_PATH, {
+    await fetch(apiUrl(sessionPath, 'chat.json'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data),
     });
   } catch {
-    // Silently ignore if API is not available
+    // Silently ignore
   }
 }
 
-/**
- * Clear chat history from both localStorage and local file.
- */
-export async function clearChatHistory(): Promise<void> {
-  localStorage.removeItem(STORAGE_KEY);
-
+export async function clearChatHistory(sessionPath: string): Promise<void> {
   try {
-    await fetch(API_PATH, { method: 'DELETE' });
+    await fetch(apiUrl(sessionPath, 'chat.json'), { method: 'DELETE' });
   } catch {
     // Silently ignore
   }

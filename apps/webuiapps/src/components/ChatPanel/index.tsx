@@ -1,5 +1,13 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Settings, X, Trash2 } from 'lucide-react';
+import {
+  Settings,
+  Trash2,
+  RotateCcw,
+  Minus,
+  Maximize2,
+  ChevronDown,
+  ChevronRight,
+} from 'lucide-react';
 import {
   chat,
   loadConfig,
@@ -28,7 +36,17 @@ import {
 } from '@/lib/appRegistry';
 import { seedMetaFiles } from '@/lib/seedMeta';
 import { dispatchAgentAction, onUserAction } from '@/lib/vibeContainerMock';
+import { closeAllWindows } from '@/lib/windowManager';
 import { getFileToolDefinitions, isFileTool, executeFileTool } from '@/lib/fileTools';
+import { setSessionPath } from '@/lib/sessionPath';
+import {
+  getMemoryToolDefinitions,
+  isMemoryTool,
+  executeMemoryTool,
+  loadMemories,
+  buildMemoryPrompt,
+  type MemoryEntry,
+} from '@/lib/memoryManager';
 import { logger } from '@/lib/logger';
 import {
   getImageGenToolDefinitions,
@@ -40,107 +58,467 @@ import {
   loadChatHistorySync,
   saveChatHistory,
   clearChatHistory,
+  buildSessionPath,
   type DisplayMessage,
 } from '@/lib/chatHistoryStorage';
+import {
+  type CharacterConfig,
+  type CharacterCollection,
+  DEFAULT_COLLECTION as DEFAULT_CHAR_COLLECTION,
+  loadCharacterCollection,
+  loadCharacterCollectionSync,
+  saveCharacterCollection,
+  getActiveCharacter,
+  getCharacterPromptContext,
+  resolveEmotionMedia,
+  clearEmotionVideoCache,
+} from '@/lib/characterManager';
+import {
+  ModManager,
+  type ModCollection,
+  DEFAULT_MOD_COLLECTION,
+  loadModCollection,
+  loadModCollectionSync,
+  saveModCollection,
+  getActiveModEntry,
+} from '@/lib/modManager';
+import CharacterPanel from './CharacterPanel';
+import ModPanel from './ModPanel';
 import styles from './index.module.scss';
 
-function buildSystemPrompt(hasImageGen: boolean): string {
-  return `You are a helpful assistant that can interact with apps on the user's device. Respond in English by default. If the user writes in another language, switch to that language.
+// ---------------------------------------------------------------------------
+// Extended DisplayMessage with character-specific fields
+// ---------------------------------------------------------------------------
 
-For casual conversation (greetings, questions, chat), just reply naturally without using any tools.
-
-When the user wants to interact with an app:
-1. Call list_apps to discover available apps and their appName
-2. file_read("apps/{appName}/meta.yaml") to learn available actions
-3. file_read("apps/{appName}/guide.md") to learn data structure and JSON schema
-4. file_list/file_read to explore data in "apps/{appName}/data/"
-5. file_write/file_delete to modify data (follow the JSON schema)
-6. app_action to notify the app to reload (e.g. REFRESH_*, SYNC_STATE)
-
-NAS paths in guide.md like "/articles/xxx.json" map to "apps/{appName}/data/articles/xxx.json".
-After writing data, ALWAYS call app_action with the corresponding REFRESH action.
-
-When you receive "[User performed action in ... (appName: xxx)]", the appName is already provided. Read its meta.yaml to understand available actions, then respond accordingly. For games, respond with your own move — think strategically.${hasImageGen ? '\n\nYou can also use generate_image to create images from text prompts.' : ''}`;
+interface CharacterDisplayMessage extends DisplayMessage {
+  emotion?: string;
+  suggestedReplies?: string[];
+  toolCalls?: string[]; // collapsed tool call summaries
 }
+
+// ---------------------------------------------------------------------------
+// Tool definitions for character system
+// ---------------------------------------------------------------------------
+
+function getRespondToUserToolDef() {
+  return {
+    type: 'function' as const,
+    function: {
+      name: 'respond_to_user',
+      description:
+        'Send a message to the user as the character. ALWAYS use this tool to respond — never output plain text.',
+      parameters: {
+        type: 'object' as const,
+        properties: {
+          character_expression: {
+            type: 'object',
+            properties: {
+              content: {
+                type: 'string',
+                description:
+                  'The message text (dialogue with optional action descriptions in parentheses)',
+              },
+              emotion: {
+                type: 'string',
+                description: 'Character emotion: happy, shy, peaceful, depressing, angry',
+              },
+            },
+            required: ['content'],
+          },
+          user_interaction: {
+            type: 'object',
+            properties: {
+              suggested_replies: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'List of 3 suggested user replies (under 25 chars each)',
+              },
+            },
+          },
+        },
+        required: ['character_expression'],
+      },
+    },
+  };
+}
+
+function getFinishTargetToolDef() {
+  return {
+    type: 'function' as const,
+    function: {
+      name: 'finish_target',
+      description:
+        'Mark story targets as completed when achieved through conversation. Do not announce this to the user.',
+      parameters: {
+        type: 'object' as const,
+        properties: {
+          target_ids: {
+            type: 'array',
+            items: { type: 'number' },
+            description: 'IDs of targets to mark as completed',
+          },
+        },
+        required: ['target_ids'],
+      },
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Build system prompt with Character + Mod context
+// ---------------------------------------------------------------------------
+
+function buildSystemPrompt(
+  character: CharacterConfig,
+  modManager: ModManager | null,
+  hasImageGen: boolean,
+  memories: MemoryEntry[] = [],
+): string {
+  let prompt = getCharacterPromptContext(character);
+
+  if (modManager) {
+    prompt += '\n' + modManager.buildStageReminder();
+  }
+
+  prompt += `
+You can interact with apps on the user's device using tools.
+
+When the user wants to interact with an app, first identify the target app from the user's intent, then follow ALL steps in order:
+1. list_apps — discover available apps
+2. file_read("apps/{appName}/meta.yaml") — learn the target app's available actions
+3. file_read("apps/{appName}/guide.md") — learn its data structure and JSON schema
+4. file_list/file_read — explore existing data in "apps/{appName}/data/"
+5. file_write/file_delete — create/modify/delete data following the JSON schema from step 3
+6. app_action — notify the app to reload (ONLY use actions defined in meta.yaml)
+
+Rules:
+- Always operate on the app the user specified. Do not redirect the operation to a different app or OS action.
+- Data mutations MUST go through file_write/file_delete. app_action only notifies the app to reload, it cannot write data.
+- After file_write, ALWAYS call app_action with the corresponding REFRESH action.
+- Do NOT skip step 5. If the user asked to save/create/add something, you must file_write the data. file_list alone does not save anything.
+- NAS paths in guide.md like "/articles/xxx.json" map to "apps/{appName}/data/articles/xxx.json".
+
+When you receive "[User performed action in ... (appName: xxx)]", the appName is already provided. Read its meta.yaml to understand available actions, then respond accordingly. For games, respond with your own move — think strategically.
+
+IMPORTANT: You MUST use the respond_to_user tool to send all messages to the user. Do NOT output plain text responses. Include your emotion and 3 suggested replies.${hasImageGen ? '\n\nYou can use generate_image to create images from text prompts. The generated image will be displayed in chat.' : ''}`;
+
+  prompt += buildMemoryPrompt(memories);
+
+  return prompt;
+}
+
+// ---------------------------------------------------------------------------
+// Helper: parse action text in parentheses as emotion markers
+// ---------------------------------------------------------------------------
+
+function renderMessageContent(content: string): React.ReactNode {
+  // Match (action text) patterns and render them as styled spans
+  const parts = content.split(/(\([^)]+\))/g);
+  return parts.map((part, i) => {
+    if (/^\([^)]+\)$/.test(part)) {
+      return (
+        <span key={i} className={styles.emotion}>
+          {part}
+        </span>
+      );
+    }
+    return part;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Stage Indicator Component
+// ---------------------------------------------------------------------------
+
+const StageIndicator: React.FC<{ modManager: ModManager | null }> = ({ modManager }) => {
+  if (!modManager) return null;
+
+  const total = modManager.stageCount;
+  const current = modManager.currentStageIndex;
+  const finished = modManager.isFinished;
+
+  return (
+    <div className={styles.stageIndicator}>
+      <span className={styles.stageText}>
+        Stage {finished ? total : current + 1}/{total}
+      </span>
+      <div className={styles.stageDots}>
+        {Array.from({ length: total }, (_, i) => (
+          <div
+            key={i}
+            className={`${styles.stageDot} ${
+              i < current || finished
+                ? styles.stageDotCompleted
+                : i === current
+                  ? styles.stageDotCurrent
+                  : ''
+            }`}
+          />
+        ))}
+      </div>
+    </div>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// Actions Taken (collapsible)
+// ---------------------------------------------------------------------------
+
+const ActionsTaken: React.FC<{ calls: string[] }> = ({ calls }) => {
+  const [open, setOpen] = useState(false);
+  if (calls.length === 0) return null;
+
+  return (
+    <div className={styles.actionsTaken}>
+      <button className={styles.actionsTakenToggle} onClick={() => setOpen(!open)}>
+        Actions taken
+        {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+      </button>
+      {open && (
+        <div className={styles.actionsTakenList}>
+          {calls.map((c, i) => (
+            <div key={i}>{c}</div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// ChatPanel
+// ---------------------------------------------------------------------------
 
 const ChatPanel: React.FC<{ onClose: () => void; visible?: boolean }> = ({
   onClose,
   visible = true,
 }) => {
-  // Init display + LLM history from localStorage cache (sync), then override from file
-  const [initialCache] = useState(() => loadChatHistorySync());
-  const [messages, setMessages] = useState<DisplayMessage[]>(initialCache?.messages ?? []);
-  const [chatHistory, setChatHistory] = useState<ChatMessage[]>(initialCache?.chatHistory ?? []);
+  // Character + Mod state (collection-based)
+  const [charCollection, setCharCollection] = useState<CharacterCollection>(
+    () => loadCharacterCollectionSync() ?? DEFAULT_CHAR_COLLECTION,
+  );
+  const character = getActiveCharacter(charCollection);
+
+  const [modCollection, setModCollection] = useState<ModCollection>(
+    () => loadModCollectionSync() ?? DEFAULT_MOD_COLLECTION,
+  );
+  const [modManager, setModManager] = useState<ModManager | null>(() => {
+    const col = loadModCollectionSync() ?? DEFAULT_MOD_COLLECTION;
+    const entry = getActiveModEntry(col);
+    return new ModManager(entry.config, entry.state);
+  });
+
+  // Session key for chat history isolation (character × mod)
+  const sessionPath = buildSessionPath(charCollection.activeId, modCollection.activeId);
+  setSessionPath(sessionPath);
+
+  // Chat state — initialized from session-scoped cache
+  const [messages, setMessages] = useState<CharacterDisplayMessage[]>(() => {
+    const cache = loadChatHistorySync(sessionPath);
+    return (cache?.messages ?? []) as CharacterDisplayMessage[];
+  });
+  const [chatHistory, setChatHistory] = useState<ChatMessage[]>(() => {
+    const cache = loadChatHistorySync(sessionPath);
+    return cache?.chatHistory ?? [];
+  });
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  // Init from localStorage immediately (sync), then override from local file if available
   const [config, setConfig] = useState<LLMConfig | null>(loadConfigSync);
   const [imageGenConfig, setImageGenConfig] = useState<ImageGenConfig | null>(
     loadImageGenConfigSync,
   );
-  const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // Refs for latest state — declared before the debounced save effect that uses them
+  // Suggested replies from latest assistant message
+  const [suggestedReplies, setSuggestedReplies] = useState<string[]>([]);
+  const [showCharacterPanel, setShowCharacterPanel] = useState(false);
+  const [showModPanel, setShowModPanel] = useState(false);
+  const [currentEmotion, setCurrentEmotion] = useState<string | undefined>();
+
+  // Memories loaded for SP injection
+  const [memories, setMemories] = useState<MemoryEntry[]>([]);
+
+  // Pending tool calls for current response (grouped per assistant turn)
+  const pendingToolCallsRef = useRef<string[]>([]);
+
+  const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
   const chatHistoryRef = useRef(chatHistory);
   chatHistoryRef.current = chatHistory;
+  const suggestedRepliesRef = useRef(suggestedReplies);
+  suggestedRepliesRef.current = suggestedReplies;
 
-  // Debounced save: persist chat history whenever messages or chatHistory change
+  // Debounced save
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  useEffect(() => {
-    // Skip saving the initial empty state (avoids overwriting persisted data on mount)
-    if (messages.length === 0 && chatHistory.length === 0) return;
+  const sessionPathRef = useRef(sessionPath);
+  sessionPathRef.current = sessionPath;
 
+  useEffect(() => {
+    if (messages.length === 0 && chatHistory.length === 0) return;
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(() => {
-      saveChatHistory(messagesRef.current, chatHistoryRef.current);
+      saveChatHistory(
+        sessionPathRef.current,
+        messagesRef.current,
+        chatHistoryRef.current,
+        suggestedRepliesRef.current,
+      );
     }, 500);
-
     return () => {
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     };
-  }, [messages, chatHistory]);
+  }, [messages, chatHistory, suggestedReplies]);
 
+  /** Seed prologue and opening replies from active mod */
+  const seedPrologue = useCallback(() => {
+    const entry = getActiveModEntry(modCollection);
+    const prologue = entry.config.prologue;
+    if (prologue) {
+      const prologueMsg: CharacterDisplayMessage = {
+        id: 'prologue',
+        role: 'assistant',
+        content: prologue,
+      };
+      setMessages([prologueMsg]);
+      setChatHistory([{ role: 'assistant', content: prologue }]);
+    } else {
+      setMessages([]);
+      setChatHistory([]);
+    }
+    const openingReplies = entry.config.opening_rec_replies;
+    setSuggestedReplies(openingReplies?.length ? openingReplies.map((r) => r.reply_text) : []);
+    setCurrentEmotion(undefined);
+  }, [modCollection]);
+
+  // Reload chat history when session (character × mod) changes
   useEffect(() => {
-    // Load from file (async, overrides localStorage cache if available)
-    loadChatHistory().then((data) => {
-      if (data) {
-        setMessages(data.messages);
-        setChatHistory(data.chatHistory);
+    loadChatHistory(sessionPath).then((data) => {
+      const loadedMessages = (data?.messages ?? []) as CharacterDisplayMessage[];
+      const loadedHistory = data?.chatHistory ?? [];
+      if (loadedMessages.length === 0 && loadedHistory.length === 0) {
+        // No history — seed prologue
+        seedPrologue();
+      } else {
+        setMessages(loadedMessages);
+        setChatHistory(loadedHistory);
+        // Restore suggested replies from saved data, or from mod config if only prologue
+        if (data?.suggestedReplies?.length) {
+          setSuggestedReplies(data.suggestedReplies);
+        } else {
+          const onlyPrologue = loadedMessages.length === 1 && loadedMessages[0].id === 'prologue';
+          if (onlyPrologue) {
+            const entry = getActiveModEntry(modCollection);
+            const openingReplies = entry.config.opening_rec_replies;
+            setSuggestedReplies(
+              openingReplies?.length ? openingReplies.map((r) => r.reply_text) : [],
+            );
+          } else {
+            setSuggestedReplies([]);
+          }
+        }
+        setCurrentEmotion(undefined);
       }
     });
+    // Load memories for SP injection
+    loadMemories(sessionPath).then(setMemories);
+  }, [sessionPath, modCollection, seedPrologue]);
+
+  // Load configs from file (async override).
+  // Empty deps [] is intentional: configs (character collection, mod collection,
+  // chat config, image-gen config) are loaded inside the effect and written to
+  // state — they are not external dependencies that should trigger re-runs.
+  useEffect(() => {
     loadConfig().then((fileConfig) => {
       if (fileConfig) setConfig(fileConfig);
     });
     loadImageGenConfig().then((fileConfig) => {
       if (fileConfig) setImageGenConfig(fileConfig);
     });
+    loadCharacterCollection().then((col) => {
+      if (col) setCharCollection(col);
+    });
+    loadModCollection().then((col) => {
+      if (col) {
+        setModCollection(col);
+        const entry = getActiveModEntry(col);
+        setModManager(new ModManager(entry.config, entry.state));
+      }
+    });
   }, []);
 
   const handleClearHistory = useCallback(async () => {
+    await clearChatHistory(sessionPathRef.current);
+    seedPrologue();
+  }, [seedPrologue]);
+
+  /** Reset entire session — clears chat, memories, app data, and mod state */
+  const handleResetSession = useCallback(async () => {
+    const sp = sessionPathRef.current;
+    // Clear server-side session directory
+    try {
+      await fetch(`/api/session-reset?path=${encodeURIComponent(sp)}`, { method: 'DELETE' });
+    } catch {
+      // ignore
+    }
+    // Clear local state
+    localStorage.removeItem(`openroom_chat_${sp.replace(/\//g, '_')}`);
     setMessages([]);
     setChatHistory([]);
-    await clearChatHistory();
-  }, []);
+    setSuggestedReplies([]);
+    setMemories([]);
+    setCurrentEmotion(undefined);
+
+    // Close all open app windows
+    closeAllWindows();
+
+    // Reset mod state
+    if (modManagerRef.current) {
+      modManagerRef.current.reset();
+      const mm = modManagerRef.current;
+      setModManager(new ModManager(mm.getConfig(), mm.getState()));
+      setModCollection((prev) => {
+        const entry = getActiveModEntry(prev);
+        const updated = {
+          ...prev,
+          items: {
+            ...prev.items,
+            [entry.config.id]: { config: entry.config, state: mm.getState() },
+          },
+        };
+        saveModCollection(updated);
+        return updated;
+      });
+    }
+
+    // Re-seed prologue and opening replies
+    seedPrologue();
+
+    // Re-seed meta files
+    await seedMetaFiles();
+  }, [modCollection, seedPrologue]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, loading]);
 
-  const addMessage = useCallback((msg: DisplayMessage) => {
+  const addMessage = useCallback((msg: CharacterDisplayMessage) => {
     setMessages((prev) => [...prev, msg]);
   }, []);
 
-  // Use refs to keep latest state for user action listener
   const configRef = useRef(config);
   configRef.current = config;
   const imageGenConfigRef = useRef(imageGenConfig);
   imageGenConfigRef.current = imageGenConfig;
+  const modManagerRef = useRef(modManager);
+  modManagerRef.current = modManager;
+  const characterRef = useRef(character);
+  characterRef.current = character;
+  const memoriesRef = useRef(memories);
+  memoriesRef.current = memories;
 
-  // User action queue + serial processing
+  // User action queue
   const actionQueueRef = useRef<string[]>([]);
   const processingRef = useRef(false);
 
@@ -170,7 +548,7 @@ const ChatPanel: React.FC<{ onClose: () => void; visible?: boolean }> = ({
     processingRef.current = false;
   }, []);
 
-  // Listen for user actions reported by apps, auto-send to LLM (e.g. AI needs to respond during a game)
+  // Listen for user actions from apps
   useEffect(() => {
     const unsubscribe = onUserAction((event: unknown) => {
       const cfg = configRef.current;
@@ -186,21 +564,10 @@ const ChatPanel: React.FC<{ onClose: () => void; visible?: boolean }> = ({
         action_result?: string;
       };
       logger.info('ChatPanel', 'onUserAction received:', evt);
-      // Ignore action_result callbacks (result callbacks triggered by Agent)
-      if (evt.action_result !== undefined) {
-        logger.info('ChatPanel', 'Ignored: action_result event');
-        return;
-      }
+      if (evt.action_result !== undefined) return;
       const action = evt.app_action;
-      if (!action) {
-        logger.info('ChatPanel', 'Ignored: no app_action');
-        return;
-      }
-      // Ignore actions triggered by Agent (trigger_by=2)
-      if (action.trigger_by === 2) {
-        logger.info('ChatPanel', 'Ignored: Agent triggered');
-        return;
-      }
+      if (!action) return;
+      if (action.trigger_by === 2) return;
 
       const app = APP_REGISTRY.find((a) => a.appId === action.app_id);
       if (!app) return;
@@ -212,94 +579,91 @@ const ChatPanel: React.FC<{ onClose: () => void; visible?: boolean }> = ({
     return unsubscribe;
   }, [processActionQueue]);
 
-  const handleSend = useCallback(async () => {
-    if (!input.trim() || loading) return;
-    if (!config?.apiKey) {
-      setShowSettings(true);
-      return;
-    }
+  // Send message
+  const handleSend = useCallback(
+    async (overrideText?: string) => {
+      const text = overrideText ?? input.trim();
+      if (!text || loading) return;
+      if (!config?.apiKey) {
+        setShowSettings(true);
+        return;
+      }
 
-    const userMsg = input.trim();
-    setInput('');
+      if (!overrideText) setInput('');
+      setSuggestedReplies([]);
 
-    const userDisplay: DisplayMessage = {
-      id: String(Date.now()),
-      role: 'user',
-      content: userMsg,
-    };
-    addMessage(userDisplay);
-
-    const newHistory: ChatMessage[] = [...chatHistory, { role: 'user', content: userMsg }];
-    setChatHistory(newHistory);
-
-    setLoading(true);
-    try {
-      await runConversation(newHistory, config);
-    } catch (err) {
-      logger.error('ChatPanel', 'Error:', err);
-      addMessage({
+      const userDisplay: CharacterDisplayMessage = {
         id: String(Date.now()),
-        role: 'assistant',
-        content: `Error: ${err instanceof Error ? err.message : String(err)}`,
-      });
-    } finally {
-      setLoading(false);
-    }
-  }, [input, loading, config, chatHistory, addMessage]);
+        role: 'user',
+        content: text,
+      };
+      addMessage(userDisplay);
 
+      const newHistory: ChatMessage[] = [...chatHistory, { role: 'user', content: text }];
+      setChatHistory(newHistory);
+
+      setLoading(true);
+      try {
+        await runConversation(newHistory, config);
+      } catch (err) {
+        logger.error('ChatPanel', 'Error:', err);
+        addMessage({
+          id: String(Date.now()),
+          role: 'assistant',
+          content: `Error: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      } finally {
+        setLoading(false);
+      }
+    },
+    [input, loading, config, chatHistory, addMessage],
+  );
+
+  // Core conversation loop
   const runConversation = async (history: ChatMessage[], cfg: LLMConfig) => {
-    logger.info(
-      'ChatPanel',
-      'runConversation called, history length:',
-      history.length,
-      'provider:',
-      cfg.provider,
-    );
     await seedMetaFiles();
     await loadActionsFromMeta();
     const hasImageGen = !!imageGenConfigRef.current?.apiKey;
+    const mm = modManagerRef.current;
+    const char = characterRef.current;
+
     const tools = [
+      getRespondToUserToolDef(),
+      getFinishTargetToolDef(),
       getListAppsToolDefinition(),
       getAppActionToolDefinition(),
       ...getFileToolDefinitions(),
+      ...getMemoryToolDefinitions(),
       ...(hasImageGen ? getImageGenToolDefinitions() : []),
     ];
-    logger.info('ToolLog', 'ChatPanel: tools passed to chat(), count=', tools.length);
+
+    const currentMemories = memoriesRef.current;
     const fullMessages: ChatMessage[] = [
-      { role: 'system', content: buildSystemPrompt(hasImageGen) },
+      { role: 'system', content: buildSystemPrompt(char, mm, hasImageGen, currentMemories) },
       ...history,
     ];
 
     let currentMessages = fullMessages;
     let iterations = 0;
     const maxIterations = 10;
-
-    logger.info('ChatDebug', '=== START conversation ===');
-    logger.info('ChatDebug', 'messages sent to LLM:', JSON.stringify(currentMessages, null, 2));
-    logger.info(
-      'ChatDebug',
-      'tools:',
-      tools.map((t) => (t as { function: { name: string } }).function.name),
-    );
+    pendingToolCallsRef.current = [];
 
     while (iterations < maxIterations) {
       iterations++;
-      logger.info('ChatDebug', `--- iteration ${iterations} ---`);
-      logger.info('ChatDebug', 'messages count:', currentMessages.length);
       const response = await chat(currentMessages, tools, cfg);
 
-      logger.info('ChatDebug', 'LLM response content:', response.content);
-      logger.info('ChatDebug', 'LLM toolCalls:', JSON.stringify(response.toolCalls, null, 2));
-
       if (response.toolCalls.length === 0) {
-        // No tool calls, just text response
+        // No tool calls — fallback plain text (shouldn't happen with respond_to_user requirement)
         if (response.content) {
           addMessage({
             id: String(Date.now()),
             role: 'assistant',
             content: response.content,
+            toolCalls:
+              pendingToolCallsRef.current.length > 0 ? [...pendingToolCallsRef.current] : undefined,
           });
           setChatHistory((prev) => [...prev, { role: 'assistant', content: response.content }]);
+          pendingToolCallsRef.current = [];
         }
         break;
       }
@@ -312,35 +676,83 @@ const ChatPanel: React.FC<{ onClose: () => void; visible?: boolean }> = ({
       };
       currentMessages = [...currentMessages, assistantMsg];
 
-      if (response.content) {
-        addMessage({
-          id: String(Date.now()),
-          role: 'assistant',
-          content: response.content,
-        });
-      }
-
       // Execute each tool call
-      logger.info(
-        'ToolLog',
-        'ChatPanel: executing toolCalls count=',
-        response.toolCalls.length,
-        'names=',
-        response.toolCalls.map((tc) => tc.function.name),
-      );
       for (const tc of response.toolCalls) {
-        logger.info('ToolLog', 'ChatPanel: processing tool name=', tc.function.name);
-        let params: Record<string, string> = {};
+        let params: Record<string, unknown> = {};
         try {
           params = JSON.parse(tc.function.arguments);
         } catch {
-          // ignore parse error
+          // ignore
         }
 
-        // list_apps tool
+        // ---- respond_to_user ----
+        if (tc.function.name === 'respond_to_user') {
+          const expr =
+            (params.character_expression as { content?: string; emotion?: string }) ?? {};
+          const interaction = (params.user_interaction as { suggested_replies?: string[] }) ?? {};
+
+          const content = expr.content ?? '';
+          const emotion = expr.emotion;
+          const replies = interaction.suggested_replies ?? [];
+
+          addMessage({
+            id: String(Date.now()),
+            role: 'assistant',
+            content,
+            emotion,
+            suggestedReplies: replies,
+            toolCalls:
+              pendingToolCallsRef.current.length > 0 ? [...pendingToolCallsRef.current] : undefined,
+          });
+          setSuggestedReplies(replies);
+          if (emotion) {
+            clearEmotionVideoCache(character.id);
+            setCurrentEmotion(emotion);
+          }
+          pendingToolCallsRef.current = [];
+
+          setChatHistory((prev) => [...prev, { role: 'assistant', content }]);
+          currentMessages = [
+            ...currentMessages,
+            { role: 'tool', content: 'Message delivered.', tool_call_id: tc.id },
+          ];
+          continue;
+        }
+
+        // ---- finish_target ----
+        if (tc.function.name === 'finish_target') {
+          const targetIds = (params.target_ids as number[]) ?? [];
+          if (mm) {
+            const result = mm.finishTarget(targetIds);
+            // Persist state via collection
+            const updatedEntry = { config: mm.getConfig(), state: mm.getState() };
+            setModCollection((prev) => {
+              const updated = {
+                ...prev,
+                items: { ...prev.items, [updatedEntry.config.id]: updatedEntry },
+              };
+              saveModCollection(updated);
+              return updated;
+            });
+            setModManager(new ModManager(mm.getConfig(), mm.getState()));
+
+            currentMessages = [
+              ...currentMessages,
+              { role: 'tool', content: JSON.stringify(result), tool_call_id: tc.id },
+            ];
+          } else {
+            currentMessages = [
+              ...currentMessages,
+              { role: 'tool', content: 'No mod loaded.', tool_call_id: tc.id },
+            ];
+          }
+          continue;
+        }
+
+        // ---- list_apps ----
         if (tc.function.name === 'list_apps') {
           const result = executeListApps();
-          logger.info('ChatDebug', 'list_apps result:', result);
+          pendingToolCallsRef.current.push(`list_apps`);
           currentMessages = [
             ...currentMessages,
             { role: 'tool', content: result, tool_call_id: tc.id },
@@ -348,19 +760,15 @@ const ChatPanel: React.FC<{ onClose: () => void; visible?: boolean }> = ({
           continue;
         }
 
-        // File tool calls — direct file operations
+        // ---- File tools ----
         if (isFileTool(tc.function.name)) {
-          addMessage({
-            id: String(Date.now()) + tc.id,
-            role: 'tool',
-            content: `Calling ${tc.function.name}...`,
-          });
+          pendingToolCallsRef.current.push(
+            `${tc.function.name}(${JSON.stringify(params).slice(0, 60)})`,
+          );
           try {
-            const result = await executeFileTool(tc.function.name, params);
-            logger.info(
-              'ChatDebug',
-              `${tc.function.name}(${JSON.stringify(params)}) result:`,
-              result.slice(0, 500),
+            const result = await executeFileTool(
+              tc.function.name,
+              params as Record<string, string>,
             );
             currentMessages = [
               ...currentMessages,
@@ -379,16 +787,12 @@ const ChatPanel: React.FC<{ onClose: () => void; visible?: boolean }> = ({
           continue;
         }
 
-        // Image generation tool call
+        // ---- Image gen ----
         if (isImageGenTool(tc.function.name)) {
-          addMessage({
-            id: String(Date.now()) + tc.id,
-            role: 'tool',
-            content: 'Generating image...',
-          });
+          pendingToolCallsRef.current.push('generate_image');
           try {
             const { result, dataUrl } = await executeImageGenTool(
-              params,
+              params as Record<string, string>,
               imageGenConfigRef.current,
             );
             if (dataUrl) {
@@ -416,9 +820,37 @@ const ChatPanel: React.FC<{ onClose: () => void; visible?: boolean }> = ({
           continue;
         }
 
-        // app_action tool
+        // ---- Memory tools ----
+        if (isMemoryTool(tc.function.name)) {
+          pendingToolCallsRef.current.push(`save_memory`);
+          try {
+            const result = await executeMemoryTool(
+              sessionPathRef.current,
+              params as Record<string, string>,
+            );
+            // Refresh memories for next turn's SP
+            loadMemories(sessionPathRef.current).then(setMemories);
+            currentMessages = [
+              ...currentMessages,
+              { role: 'tool', content: result, tool_call_id: tc.id },
+            ];
+          } catch (err) {
+            currentMessages = [
+              ...currentMessages,
+              {
+                role: 'tool',
+                content: `error: ${err instanceof Error ? err.message : String(err)}`,
+                tool_call_id: tc.id,
+              },
+            ];
+          }
+          continue;
+        }
+
+        // ---- app_action ----
         if (tc.function.name === 'app_action') {
-          const resolved = resolveAppAction(params.app_name, params.action_type);
+          const strParams = params as Record<string, string>;
+          const resolved = resolveAppAction(strParams.app_name, strParams.action_type);
           if (typeof resolved === 'string') {
             currentMessages = [
               ...currentMessages,
@@ -427,18 +859,14 @@ const ChatPanel: React.FC<{ onClose: () => void; visible?: boolean }> = ({
             continue;
           }
 
-          addMessage({
-            id: String(Date.now()) + tc.id,
-            role: 'tool',
-            content: `Calling ${params.app_name}/${params.action_type}...`,
-          });
+          pendingToolCallsRef.current.push(`${strParams.app_name}/${strParams.action_type}`);
 
           let actionParams: Record<string, string> = {};
-          if (params.params) {
+          if (strParams.params) {
             try {
-              actionParams = JSON.parse(params.params);
+              actionParams = JSON.parse(strParams.params);
             } catch {
-              // use empty params
+              // empty
             }
           }
 
@@ -472,8 +900,8 @@ const ChatPanel: React.FC<{ onClose: () => void; visible?: boolean }> = ({
         ];
       }
 
-      // Update chat history with tool interactions
-      setChatHistory(currentMessages.slice(1)); // Remove system message
+      // Update chat history
+      setChatHistory(currentMessages.slice(1));
     }
   };
 
@@ -489,77 +917,150 @@ const ChatPanel: React.FC<{ onClose: () => void; visible?: boolean }> = ({
   return (
     <>
       <div className={styles.panel} data-testid="chat-panel">
-        <div className={styles.header}>
-          <span>Chat</span>
-          <div className={styles.headerActions}>
-            <button
-              className={styles.iconBtn}
-              onClick={handleClearHistory}
-              title="Clear chat"
-              data-testid="clear-chat"
-            >
-              <Trash2 size={16} />
-            </button>
-            <button
-              className={styles.iconBtn}
-              onClick={() => setShowSettings(true)}
-              title="Settings"
-              data-testid="settings-btn"
-            >
-              <Settings size={16} />
-            </button>
-            <button className={styles.iconBtn} onClick={onClose} title="Close">
-              <X size={16} />
-            </button>
-          </div>
+        {/* Left: Character Avatar */}
+        <div className={styles.avatarSide}>
+          {(() => {
+            // Resolve media for the active emotion, or fall back to "peaceful" as idle
+            const idleEmotion = 'default';
+            const activeEmotion = currentEmotion || idleEmotion;
+            const isIdle = !currentEmotion;
+            const media = resolveEmotionMedia(character, activeEmotion);
+
+            if (!media) {
+              return (
+                <div className={styles.avatarPlaceholder}>{character.character_name.charAt(0)}</div>
+              );
+            }
+
+            return media.type === 'video' ? (
+              <video
+                key={media.url}
+                className={styles.avatarImage}
+                src={media.url}
+                autoPlay
+                loop={isIdle}
+                muted
+                playsInline
+                onEnded={isIdle ? undefined : () => setCurrentEmotion(undefined)}
+              />
+            ) : (
+              <img className={styles.avatarImage} src={media.url} alt={character.character_name} />
+            );
+          })()}
         </div>
 
-        <div className={styles.messages} data-testid="chat-messages">
-          {messages.length === 0 && (
-            <div className={styles.emptyState}>
-              {config?.apiKey ? 'Start a conversation...' : 'Click ⚙ to configure your LLM API key'}
+        {/* Right: Chat */}
+        <div className={styles.chatSide}>
+          <div className={styles.header}>
+            <div
+              className={styles.headerLeft}
+              onClick={() => setShowCharacterPanel(true)}
+              style={{ cursor: 'pointer' }}
+            >
+              <span className={styles.characterName}>{character.character_name}</span>
+              <ChevronRight size={14} style={{ color: 'rgba(255,255,255,0.4)' }} />
+            </div>
+            <div className={styles.headerActions}>
+              <div onClick={() => setShowModPanel(true)} style={{ cursor: 'pointer' }}>
+                <StageIndicator modManager={modManager} />
+              </div>
+              <button
+                className={styles.iconBtn}
+                onClick={handleResetSession}
+                title="Reset session"
+                data-testid="reset-session"
+              >
+                <RotateCcw size={16} />
+              </button>
+              <button
+                className={styles.iconBtn}
+                onClick={handleClearHistory}
+                title="Clear chat"
+                data-testid="clear-chat"
+              >
+                <Trash2 size={16} />
+              </button>
+              <button
+                className={styles.iconBtn}
+                onClick={() => setShowSettings(true)}
+                title="Settings"
+                data-testid="settings-btn"
+              >
+                <Settings size={16} />
+              </button>
+              <button className={styles.iconBtn} onClick={onClose} title="Minimize">
+                <Minus size={16} />
+              </button>
+              <button className={styles.iconBtn} title="Maximize">
+                <Maximize2 size={16} />
+              </button>
+            </div>
+          </div>
+
+          <div className={styles.messages} data-testid="chat-messages">
+            {messages.length === 0 && (
+              <div className={styles.emptyState}>
+                {config?.apiKey
+                  ? `${character.character_name} is ready to chat...`
+                  : 'Click the gear icon to configure your LLM API key'}
+              </div>
+            )}
+            {messages.map((msg) => (
+              <React.Fragment key={msg.id}>
+                <div
+                  className={`${styles.message} ${
+                    msg.role === 'user'
+                      ? styles.user
+                      : msg.role === 'tool'
+                        ? styles.toolInfo
+                        : styles.assistant
+                  }`}
+                >
+                  {msg.role === 'assistant' ? renderMessageContent(msg.content) : msg.content}
+                  {msg.imageUrl && (
+                    <img src={msg.imageUrl} alt="Generated" className={styles.messageImage} />
+                  )}
+                </div>
+                {msg.toolCalls && msg.toolCalls.length > 0 && (
+                  <ActionsTaken calls={msg.toolCalls} />
+                )}
+              </React.Fragment>
+            ))}
+            {loading && <div className={styles.loading}>Thinking...</div>}
+            <div ref={messagesEndRef} />
+          </div>
+
+          {/* Suggested Replies */}
+          {suggestedReplies.length > 0 && !loading && (
+            <div className={styles.suggestedReplies}>
+              {suggestedReplies.map((reply, i) => (
+                <button key={i} className={styles.suggestedReply} onClick={() => handleSend(reply)}>
+                  {reply}
+                </button>
+              ))}
             </div>
           )}
-          {messages.map((msg) => (
-            <div
-              key={msg.id}
-              className={`${styles.message} ${
-                msg.role === 'user'
-                  ? styles.user
-                  : msg.role === 'tool'
-                    ? styles.toolInfo
-                    : styles.assistant
-              }`}
-            >
-              {msg.content}
-              {msg.imageUrl && (
-                <img src={msg.imageUrl} alt="Generated" className={styles.messageImage} />
-              )}
-            </div>
-          ))}
-          {loading && <div className={styles.loading}>Thinking...</div>}
-          <div ref={messagesEndRef} />
-        </div>
 
-        <div className={styles.inputArea}>
-          <textarea
-            className={styles.input}
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={handleKeyDown}
-            placeholder="Type a message..."
-            rows={1}
-            disabled={loading}
-            data-testid="chat-input"
-          />
-          <button
-            className={styles.sendBtn}
-            onClick={handleSend}
-            disabled={loading || !input.trim()}
-            data-testid="send-btn"
-          >
-            Send
-          </button>
+          <div className={styles.inputArea}>
+            <textarea
+              className={styles.input}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder="Type a message..."
+              rows={1}
+              disabled={loading}
+              data-testid="chat-input"
+            />
+            <button
+              className={styles.sendBtn}
+              onClick={() => handleSend()}
+              disabled={loading || !input.trim()}
+              data-testid="send-btn"
+            >
+              Send
+            </button>
+          </div>
         </div>
       </div>
 
@@ -570,19 +1071,46 @@ const ChatPanel: React.FC<{ onClose: () => void; visible?: boolean }> = ({
           onSave={(c, igc) => {
             setConfig(c);
             setImageGenConfig(igc);
-            // Persist both configs atomically to ~/.openroom/config.json
             saveConfig(c, igc);
-            if (igc) {
-              saveImageGenConfig(igc);
-            }
+            if (igc) saveImageGenConfig(igc);
             setShowSettings(false);
           }}
           onClose={() => setShowSettings(false)}
         />
       )}
+
+      {showCharacterPanel && (
+        <CharacterPanel
+          collection={charCollection}
+          onSave={(col) => {
+            setCharCollection(col);
+            saveCharacterCollection(col);
+            setShowCharacterPanel(false);
+          }}
+          onClose={() => setShowCharacterPanel(false)}
+        />
+      )}
+
+      {showModPanel && (
+        <ModPanel
+          collection={modCollection}
+          onSave={(col) => {
+            setModCollection(col);
+            saveModCollection(col);
+            const entry = getActiveModEntry(col);
+            setModManager(new ModManager(entry.config, entry.state));
+            setShowModPanel(false);
+          }}
+          onClose={() => setShowModPanel(false)}
+        />
+      )}
     </>
   );
 };
+
+// ---------------------------------------------------------------------------
+// Settings Modal (extended with Character + Mod)
+// ---------------------------------------------------------------------------
 
 const SettingsModal: React.FC<{
   config: LLMConfig | null;
@@ -590,13 +1118,14 @@ const SettingsModal: React.FC<{
   onSave: (_config: LLMConfig, _igConfig: ImageGenConfig | null) => void;
   onClose: () => void;
 }> = ({ config, imageGenConfig, onSave, onClose }) => {
+  // LLM settings
   const [provider, setProvider] = useState<LLMProvider>(config?.provider || 'minimax');
   const [apiKey, setApiKey] = useState(config?.apiKey || '');
   const [baseUrl, setBaseUrl] = useState(config?.baseUrl || getDefaultConfig('minimax').baseUrl);
   const [model, setModel] = useState(config?.model || getDefaultConfig('minimax').model);
   const [customHeaders, setCustomHeaders] = useState(config?.customHeaders || '');
 
-  // Image generation settings
+  // Image gen settings
   const [igProvider, setIgProvider] = useState<ImageGenProvider>(
     imageGenConfig?.provider || 'gemini',
   );

@@ -70,6 +70,11 @@ export function closeWindow(appId: number): void {
   notify();
 }
 
+export function closeAllWindows(): void {
+  windows = [];
+  notify();
+}
+
 export function focusWindow(appId: number): void {
   const win = windows.find((w) => w.appId === appId);
   if (win) {
