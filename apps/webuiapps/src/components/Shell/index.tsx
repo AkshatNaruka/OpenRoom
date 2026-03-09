@@ -20,7 +20,7 @@ import ChatPanel from '../ChatPanel';
 import AppWindow from '../AppWindow';
 import { getWindows, subscribe, openWindow } from '@/lib/windowManager';
 import { getDesktopApps } from '@/lib/appRegistry';
-import { reportUserOsAction } from '@/lib/vibeContainerMock';
+import { reportUserOsAction, onOSEvent } from '@/lib/vibeContainerMock';
 import { setReportUserActions } from '@/lib';
 import i18next from 'i18next';
 import { seedMetaFiles } from '@/lib/seedMeta';
@@ -102,6 +102,15 @@ const Shell: React.FC = () => {
     seedMetaFiles();
   }, []);
 
+  // Listen for OS events (e.g. wallpaper changes from agent)
+  useEffect(() => {
+    return onOSEvent((event) => {
+      if (event.type === 'SET_WALLPAPER' && typeof event.wallpaper_url === 'string') {
+        setWallpaper(event.wallpaper_url);
+      }
+    });
+  }, []);
+
   return (
     <div
       className={styles.shell}
@@ -153,41 +162,43 @@ const Shell: React.FC = () => {
       {/* Chat Panel — always mounted to preserve chat history */}
       <ChatPanel onClose={() => setChatOpen(false)} visible={chatOpen} />
 
-      <button
-        className={`${styles.liveWallpaperToggle} ${chatOpen ? styles.chatOpen : ''} ${liveWallpaper ? styles.liveOn : styles.liveOff}`}
-        onClick={() => setLiveWallpaper((prev) => !prev)}
-        title={liveWallpaper ? 'Live wallpaper: ON' : 'Live wallpaper: OFF'}
-        data-testid="wallpaper-toggle"
-      >
-        {liveWallpaper ? <Video size={16} /> : <VideoOff size={16} />}
-      </button>
+      <div className={`${styles.bottomBar} ${chatOpen ? styles.chatOpen : ''}`}>
+        <button
+          className={`${styles.barBtn} ${liveWallpaper ? styles.liveOn : styles.liveOff}`}
+          onClick={() => setLiveWallpaper((prev) => !prev)}
+          title={liveWallpaper ? 'Live wallpaper: ON' : 'Live wallpaper: OFF'}
+          data-testid="wallpaper-toggle"
+        >
+          {liveWallpaper ? <Video size={16} /> : <VideoOff size={16} />}
+        </button>
 
-      <button
-        className={`${styles.langToggle} ${chatOpen ? styles.chatOpen : ''}`}
-        onClick={handleToggleLang}
-        title={lang === 'en' ? 'Switch to Chinese' : 'Switch to English'}
-        data-testid="lang-toggle"
-      >
-        {lang === 'en' ? 'EN' : 'ZH'}
-      </button>
+        <button
+          className={`${styles.barBtn} ${styles.langBtn}`}
+          onClick={handleToggleLang}
+          title={lang === 'en' ? 'Switch to Chinese' : 'Switch to English'}
+          data-testid="lang-toggle"
+        >
+          {lang === 'en' ? 'EN' : 'ZH'}
+        </button>
 
-      <button
-        className={`${styles.reportToggle} ${chatOpen ? styles.chatOpen : ''} ${reportEnabled ? styles.reportOn : styles.reportOff}`}
-        onClick={handleToggleReport}
-        title={reportEnabled ? 'User action reporting: ON' : 'User action reporting: OFF'}
-        data-testid="report-toggle"
-      >
-        <Radio size={16} />
-      </button>
+        <button
+          className={`${styles.barBtn} ${reportEnabled ? styles.reportOn : styles.reportOff}`}
+          onClick={handleToggleReport}
+          title={reportEnabled ? 'User action reporting: ON' : 'User action reporting: OFF'}
+          data-testid="report-toggle"
+        >
+          <Radio size={16} />
+        </button>
 
-      <button
-        className={`${styles.chatToggle} ${chatOpen ? styles.chatOpen : ''}`}
-        onClick={() => setChatOpen(!chatOpen)}
-        title="Toggle Chat"
-        data-testid="chat-toggle"
-      >
-        <MessageCircle size={20} />
-      </button>
+        <button
+          className={`${styles.barBtn} ${styles.chatBtn}`}
+          onClick={() => setChatOpen(!chatOpen)}
+          title="Toggle Chat"
+          data-testid="chat-toggle"
+        >
+          <MessageCircle size={18} />
+        </button>
+      </div>
     </div>
   );
 };

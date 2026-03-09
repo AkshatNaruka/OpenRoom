@@ -12,7 +12,9 @@ import { join } from 'path';
 import { generateLogFileName, createLogMiddleware } from './src/lib/logPlugin';
 
 const LLM_CONFIG_FILE = resolve(os.homedir(), '.openroom', 'config.json');
-const CHAT_HISTORY_FILE = resolve(os.homedir(), '.openroom', 'history', 'chat.json');
+const SESSIONS_DIR = resolve(os.homedir(), '.openroom', 'sessions');
+const CHARACTERS_FILE = resolve(os.homedir(), '.openroom', 'characters.json');
+const MODS_FILE = resolve(os.homedir(), '.openroom', 'mods.json');
 
 /** LLM config persistence plugin — reads/writes config to ~/.openroom/config.json */
 function llmConfigPlugin(): Plugin {
@@ -29,8 +31,8 @@ function llmConfigPlugin(): Plugin {
               res.writeHead(200);
               res.end(content);
             } else {
-              res.writeHead(404);
-              res.end(JSON.stringify({ error: 'No config file found' }));
+              res.writeHead(200);
+              res.end('{}');
             }
           } catch (err) {
             res.writeHead(500);
@@ -66,23 +68,81 @@ function llmConfigPlugin(): Plugin {
   };
 }
 
-/** Chat history persistence plugin — reads/writes to ~/.openroom/history/chat.json */
-function chatHistoryPlugin(): Plugin {
+/**
+ * Session data plugin — reads/writes files under ~/.openroom/sessions/
+ * API: /api/session-data?path={charId}/{modId}/chat/history.json
+ * Supports GET, POST, DELETE.
+ */
+function sessionDataPlugin(): Plugin {
   return {
-    name: 'chat-history',
+    name: 'session-data',
     configureServer(server) {
-      server.middlewares.use('/api/chat-history', (req, res) => {
+      server.middlewares.use('/api/session-data', (req, res) => {
         res.setHeader('Content-Type', 'application/json');
+
+        const url = new URL(req.url || '', 'http://localhost');
+        const relPath = url.searchParams.get('path') || '';
+        const action = url.searchParams.get('action') || '';
+
+        if (!relPath) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'Missing path parameter' }));
+          return;
+        }
+
+        // Sanitize: only allow alphanumeric, underscore, hyphen, dot, forward slash
+        const safePath = relPath.replace(/[^a-zA-Z0-9_\-./]/g, '_').replace(/\.\./g, '');
+        const filePath = join(SESSIONS_DIR, safePath);
+
+        // Directory listing: ?action=list&path=...
+        if (action === 'list' && req.method === 'GET') {
+          try {
+            if (!fs.existsSync(filePath) || !fs.statSync(filePath).isDirectory()) {
+              res.writeHead(200);
+              res.end(JSON.stringify({ files: [], not_exists: !fs.existsSync(filePath) }));
+              return;
+            }
+            const entries = fs.readdirSync(filePath, { withFileTypes: true });
+            const files = entries.map((e) => ({
+              path: safePath === '' || safePath === '/' ? e.name : `${safePath}/${e.name}`,
+              type: e.isDirectory() ? 1 : 0,
+              size: e.isDirectory() ? 0 : fs.statSync(join(filePath, e.name)).size,
+            }));
+            res.writeHead(200);
+            res.end(JSON.stringify({ files, not_exists: false }));
+          } catch (err) {
+            res.writeHead(500);
+            res.end(JSON.stringify({ error: String(err) }));
+          }
+          return;
+        }
 
         if (req.method === 'GET') {
           try {
-            if (fs.existsSync(CHAT_HISTORY_FILE)) {
-              const content = fs.readFileSync(CHAT_HISTORY_FILE, 'utf-8');
-              res.writeHead(200);
-              res.end(content);
+            if (fs.existsSync(filePath)) {
+              const ext = filePath.split('.').pop()?.toLowerCase() || '';
+              const binaryMimes: Record<string, string> = {
+                png: 'image/png',
+                jpg: 'image/jpeg',
+                jpeg: 'image/jpeg',
+                gif: 'image/gif',
+                webp: 'image/webp',
+                svg: 'image/svg+xml',
+                mp4: 'video/mp4',
+                webm: 'video/webm',
+              };
+              const mime = binaryMimes[ext];
+              if (mime) {
+                res.setHeader('Content-Type', mime);
+                res.writeHead(200);
+                res.end(fs.readFileSync(filePath));
+              } else {
+                res.writeHead(200);
+                res.end(fs.readFileSync(filePath, 'utf-8'));
+              }
             } else {
-              res.writeHead(404);
-              res.end(JSON.stringify({ error: 'No history file found' }));
+              res.writeHead(200);
+              res.end('{}');
             }
           } catch (err) {
             res.writeHead(500);
@@ -96,11 +156,19 @@ function chatHistoryPlugin(): Plugin {
           req.on('data', (chunk: Buffer) => chunks.push(chunk));
           req.on('end', () => {
             try {
-              const body = Buffer.concat(chunks).toString();
-              JSON.parse(body);
-              const dir = resolve(os.homedir(), '.openroom', 'history');
+              const buf = Buffer.concat(chunks);
+              const dir = filePath.substring(0, filePath.lastIndexOf('/'));
               fs.mkdirSync(dir, { recursive: true });
-              fs.writeFileSync(CHAT_HISTORY_FILE, body, 'utf-8');
+              const ct = (req.headers['content-type'] || '').toLowerCase();
+              if (
+                ct.startsWith('image/') ||
+                ct.startsWith('video/') ||
+                ct === 'application/octet-stream'
+              ) {
+                fs.writeFileSync(filePath, buf);
+              } else {
+                fs.writeFileSync(filePath, buf.toString(), 'utf-8');
+              }
               res.writeHead(200);
               res.end(JSON.stringify({ ok: true }));
             } catch (err) {
@@ -113,8 +181,8 @@ function chatHistoryPlugin(): Plugin {
 
         if (req.method === 'DELETE') {
           try {
-            if (fs.existsSync(CHAT_HISTORY_FILE)) {
-              fs.unlinkSync(CHAT_HISTORY_FILE);
+            if (fs.existsSync(filePath)) {
+              fs.unlinkSync(filePath);
             }
             res.writeHead(200);
             res.end(JSON.stringify({ ok: true }));
@@ -127,6 +195,39 @@ function chatHistoryPlugin(): Plugin {
 
         res.writeHead(405);
         res.end(JSON.stringify({ error: 'Method not allowed' }));
+      });
+
+      // Session reset: DELETE /api/session-data?action=reset&path={charId}/{modId}
+      // Recursively removes the entire session directory
+      server.middlewares.use('/api/session-reset', (req, res) => {
+        res.setHeader('Content-Type', 'application/json');
+        if (req.method !== 'DELETE') {
+          res.writeHead(405);
+          res.end(JSON.stringify({ error: 'Method not allowed' }));
+          return;
+        }
+
+        const url = new URL(req.url || '', 'http://localhost');
+        const relPath = url.searchParams.get('path') || '';
+        if (!relPath) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'Missing path parameter' }));
+          return;
+        }
+
+        const safePath = relPath.replace(/[^a-zA-Z0-9_\-./]/g, '_').replace(/\.\./g, '');
+        const targetDir = join(SESSIONS_DIR, safePath);
+
+        try {
+          if (fs.existsSync(targetDir)) {
+            fs.rmSync(targetDir, { recursive: true, force: true });
+          }
+          res.writeHead(200);
+          res.end(JSON.stringify({ ok: true }));
+        } catch (err) {
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: String(err) }));
+        }
       });
     },
   };
@@ -217,6 +318,56 @@ function llmProxyPlugin(): Plugin {
   };
 }
 
+/** Generic JSON file persistence plugin factory */
+function jsonFilePlugin(name: string, apiPath: string, filePath: string): Plugin {
+  return {
+    name,
+    configureServer(server) {
+      server.middlewares.use(apiPath, (req, res) => {
+        res.setHeader('Content-Type', 'application/json');
+
+        if (req.method === 'GET') {
+          try {
+            if (fs.existsSync(filePath)) {
+              res.writeHead(200);
+              res.end(fs.readFileSync(filePath, 'utf-8'));
+            } else {
+              res.writeHead(200);
+              res.end('{}');
+            }
+          } catch (err) {
+            res.writeHead(500);
+            res.end(JSON.stringify({ error: String(err) }));
+          }
+          return;
+        }
+
+        if (req.method === 'POST') {
+          const chunks: Buffer[] = [];
+          req.on('data', (chunk: Buffer) => chunks.push(chunk));
+          req.on('end', () => {
+            try {
+              const body = Buffer.concat(chunks).toString();
+              JSON.parse(body);
+              fs.mkdirSync(resolve(os.homedir(), '.openroom'), { recursive: true });
+              fs.writeFileSync(filePath, body, 'utf-8');
+              res.writeHead(200);
+              res.end(JSON.stringify({ ok: true }));
+            } catch (err) {
+              res.writeHead(500);
+              res.end(JSON.stringify({ error: String(err) }));
+            }
+          });
+          return;
+        }
+
+        res.writeHead(405);
+        res.end(JSON.stringify({ error: 'Method not allowed' }));
+      });
+    },
+  };
+}
+
 const config = ({ mode }: ConfigEnv): UserConfigExport => {
   const env = loadEnv(mode, process.cwd(), '');
   const isProd = env.NODE_ENV === 'production';
@@ -241,9 +392,11 @@ const config = ({ mode }: ConfigEnv): UserConfigExport => {
   const skipLegacy = env.VITE_SKIP_LEGACY === 'true';
   const plugins: PluginOption[] = [
     llmConfigPlugin(),
-    chatHistoryPlugin(),
+    sessionDataPlugin(),
     logServerPlugin(),
     llmProxyPlugin(),
+    jsonFilePlugin('characters', '/api/characters', CHARACTERS_FILE),
+    jsonFilePlugin('mods', '/api/mods', MODS_FILE),
     react(),
     ...(skipLegacy
       ? []

@@ -2,11 +2,11 @@
  * @gui/vibe-container Local Mock
  *
  * Replaces the real vibe-container SDK so Apps can run standalone without an iframe host.
- * File operations are delegated to IndexedDB; Actions communicate via a local event bus.
+ * File operations are delegated to disk storage; Actions communicate via a local event bus.
  */
 
 import i18next from 'i18next';
-import * as idb from './indexedDbStorage';
+import * as idb from './diskStorage';
 import { logger } from './logger';
 import { isReportUserActionsEnabled } from './action';
 
@@ -77,7 +77,7 @@ import { openWindow, closeWindow, getWindows as getWins } from './windowManager'
 
 /**
  * Translate Action params: LLM params -> App-expected param format
- * For Actions that require pre-written files, write to IndexedDB first, then replace params with filePath
+ * For Actions that require pre-written files, write to disk storage first, then replace params with filePath
  */
 /**
  * Pass through Action params without any transformation.
@@ -93,7 +93,7 @@ function translateActionParams(action: {
 }
 
 /**
- * Read App data from IndexedDB for the LLM to directly obtain context.
+ * Read App data from disk storage for the LLM to directly obtain context.
  * For REFRESH / query-type actions, returns a data summary string; otherwise returns null.
  */
 
@@ -241,7 +241,7 @@ const mockManager = {
   handshake: () => Promise.resolve(),
   ready: () => Promise.resolve(),
 
-  // File operations — delegated to IndexedDB
+  // File operations — delegated to disk storage
   listFiles: <T>(data: { path: string }): Promise<T> => idb.listFiles(data.path) as Promise<T>,
 
   getFile: <T>(data: { file_path: string }): Promise<T> =>

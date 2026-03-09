@@ -1,9 +1,9 @@
 /**
- * File Tools - Allow Agent to directly read/write IndexedDB file storage
+ * File Tools - Allow Agent to directly read/write disk-based file storage
  * Simulates chat-agent's nas_file_read / nas_file_write capabilities
  */
 
-import * as idb from './indexedDbStorage';
+import * as idb from './diskStorage';
 import { logger } from './logger';
 
 /**
