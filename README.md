@@ -8,6 +8,7 @@
 
 **[Website](https://www.openroom.ai)** · **[X / Twitter](https://x.com/openroom_ai_)**
 
+https://github.com/user-attachments/assets/adb176a3-02db-41e0-ba71-c9f9cece13d5
 
 ## What is VibeApps?
 
