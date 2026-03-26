@@ -459,6 +459,26 @@ describe('chat()', () => {
 
       expect(result.content).toBe('Hello there');
     });
+
+    it('converts inline XML-style tool call content into structured tool calls', async () => {
+      const inlineToolContent = `<tool_call>
+respond_to_user
+<arg_key>character_expression</arg_key>
+<arg_value>{"content":"What? Did I catch you off guard?","emotion":"happy"}</arg_value>
+<arg_key>user_interaction</arg_key>
+<arg_value>{"suggested_replies":["Just hanging around","What reunion?","Tell me more"]}</arg_value>
+</tool_call>`;
+      globalThis.fetch = vi.fn().mockResolvedValueOnce(makeOpenAIResponse(inlineToolContent));
+
+      const result = await chat(MOCK_MESSAGES, MOCK_TOOLS, MOCK_LLAMACPP_CONFIG);
+
+      expect(result.content).toBe('');
+      expect(result.toolCalls).toHaveLength(1);
+      expect(result.toolCalls[0].function.name).toBe('respond_to_user');
+      expect(result.toolCalls[0].function.arguments).toBe(
+        '{"character_expression":{"content":"What? Did I catch you off guard?","emotion":"happy"},"user_interaction":{"suggested_replies":["Just hanging around","What reunion?","Tell me more"]}}',
+      );
+    });
   });
 
   describe('Anthropic provider', () => {
